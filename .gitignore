@@ -1,2 +1,7 @@
 .env
 __pycache__
+frontend
+pyproject.toml
+uv.lock
+.venv
+videos

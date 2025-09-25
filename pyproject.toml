@@ -14,5 +14,7 @@ dependencies = [
     "pyannote-audio>=3.4.0",
     "python-dotenv>=1.1.1",
     "python-multipart>=0.0.20",
+    "resemblyzer>=0.1.4",
     "uvicorn>=0.35.0",
+    "webrtcvad>=2.0.10",
 ]

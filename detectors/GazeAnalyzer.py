@@ -1,7 +1,7 @@
+
 import os
 import cv2
 import json
-import datetime
 import time
 import gc
 import logging
@@ -9,30 +9,43 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import warnings
-from gaze_tracking import GazeTracking
+from gaze_tracking.gaze_tracking import GazeTracking
 
 warnings.filterwarnings("ignore")
 
 @dataclass
-class GazeConfig:
-    """Configuration parameters for gaze analysis"""
-    min_event_duration: float = 2.0
+class GazeTrackerConfig:
+    """Configuration for gaze tracking parameters"""
+
+    # Core thresholds
+    min_event_duration: float = 1.0
     horizontal_thresholds: Tuple[float, float] = (0.35, 0.65)
     vertical_thresholds: Tuple[float, float] = (0.43, 0.57)
-    frame_processing_interval: int = 3
+    frame_skip: int = 12
     confidence_threshold: float = 0.7
+
+    # Processing control
     log_level: str = "INFO"
     max_tracking_failures: int = 100
-    early_stop_failure_rate: float = 0.95
+    early_stop_threshold: float = 0.95
     max_consecutive_failures: int = 30
+    tracking_loss_timeout: float = 0.3
+
+    # Optional features
+    face_detection_enabled: bool = False
+    calibration_duration: float = 2.0
+    smoothing_factor: float = 0.25
+    hysteresis_margin: float = 0.05
+    dwell_time_ms: int = 200
 
 @dataclass
 class GazeEvent:
-    """Data structure for gaze tracking events"""
+    """Represents a gaze tracking event"""
+
     event_type: str
     direction: str
-    start_timestamp: float
-    end_timestamp: float
+    start_time: float
+    end_time: float
     duration: float
     start_frame: int
     end_frame: int
@@ -40,37 +53,60 @@ class GazeEvent:
     vertical_ratio: Optional[float] = None
     confidence: float = 0.7
 
-class GazeAnalyzer:
-    """Advanced gaze tracking system for video analysis"""
+class VideoGazeTracker:
+    """Professional gaze tracking system for video analysis"""
 
-    def __init__(self, config: GazeConfig = None):
-        """Initialize analyzer with configuration"""
-        self.config = config or GazeConfig()
-        self.logger = self._setup_logging()
+    def __init__(self, config: GazeTrackerConfig = None):
+        self.config = config or GazeTrackerConfig()
+        self.logger = self._init_logger()
 
-        # Initialize gaze tracking
         try:
-            self.gaze_tracker = GazeTracking()
+            self.tracker = GazeTracking()
         except Exception as e:
-            self.logger.error(f"Failed to initialize gaze tracking: {e}")
+            self.logger.error(f"Failed to initialize gaze tracker: {e}")
             raise
 
-        # Tracking state
+        # State variables
         self.events: List[GazeEvent] = []
-        self.current_gaze = None
+        self.current_direction = None
         self.current_event_start = None
-        self.current_event_start_frame = None
+        self.current_event_frame = None
 
-        # Statistics and monitoring
+        # Tracking state
+        self.last_valid_time: Optional[float] = None
+        self.last_valid_frame: Optional[int] = None
+        self.last_valid_direction: Optional[str] = None
+
+        # Face detector (optional)
+        try:
+            self.face_detector = cv2.CascadeClassifier(
+                cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            )
+        except:
+            self.face_detector = None
+
+        # Calibration state
+        self.calibration_start: Optional[float] = None
+        self.is_calibrated: bool = False
+        self.h_calibration_samples: List[float] = []
+        self.v_calibration_samples: List[float] = []
+        self.h_center: float = 0.5
+        self.v_center: float = 0.5
+        self.h_smoothed: Optional[float] = None
+        self.v_smoothed: Optional[float] = None
+        self.pending_direction: Optional[str] = None
+        self.pending_start_time: Optional[float] = None
+        self.tracking_active: bool = False
+
+        # Statistics
         self.processing_stats = {}
-        self.frame_processing_times = []
-        self.tracking_failures = 0
+        self.frame_times = []
+        self.failure_count = 0
         self.consecutive_failures = 0
-        self.total_frames_processed = 0
+        self.total_frames = 0
 
-    def _setup_logging(self) -> logging.Logger:
-        """Configure logging system"""
-        logger = logging.getLogger(f"{__name__}.GazeAnalyzer")
+    def _init_logger(self) -> logging.Logger:
+        logger = logging.getLogger(f"{__name__}.VideoGazeTracker")
         logger.setLevel(getattr(logging, self.config.log_level.upper()))
 
         if not logger.handlers:
@@ -81,8 +117,7 @@ class GazeAnalyzer:
 
         return logger
 
-    def _validate_input(self, video_path: str) -> bool:
-        """Validate video file exists and is accessible"""
+    def _validate_video(self, video_path: str) -> bool:
         if not os.path.exists(video_path):
             self.logger.error(f"Video file not found: {video_path}")
             return False
@@ -91,15 +126,13 @@ class GazeAnalyzer:
             self.logger.error(f"Path is not a file: {video_path}")
             return False
 
-        # Check file size (warn if > 2GB for gaze tracking)
-        file_size = os.path.getsize(video_path) / (1024 * 1024)
-        if file_size > 2000:
-            self.logger.warning(f"Large file detected: {file_size:.1f}MB - processing may be slow")
+        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        if file_size_mb > 2000:
+            self.logger.warning(f"Large file detected: {file_size_mb:.1f}MB")
 
         return True
 
-    def _get_video_info(self, cap: cv2.VideoCapture) -> Dict:
-        """Extract video metadata"""
+    def _get_video_metadata(self, cap: cv2.VideoCapture) -> Dict:
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -112,77 +145,141 @@ class GazeAnalyzer:
             'width': width,
             'height': height,
             'duration_sec': round(duration, 2),
-            'estimated_processing_frames': frame_count // self.config.frame_processing_interval
+            'processing_frames': frame_count // self.config.frame_skip
         }
 
-    def _get_gaze_direction(self) -> Optional[str]:
-        """Detect gaze direction with configurable thresholds"""
+    def _detect_face(self, frame: np.ndarray) -> bool:
+        if not self.config.face_detection_enabled or self.face_detector is None:
+            return True
+
         try:
-            if not self.gaze_tracker.pupils_located:
-                return None
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.face_detector.detectMultiScale(gray, 1.1, 3)
+            return len(faces) > 0
+        except:
+            return True
 
-            h_ratio = self.gaze_tracker.horizontal_ratio()
-            v_ratio = self.gaze_tracker.vertical_ratio()
+    def _start_calibration(self, timestamp: float):
+        if self.calibration_start is None:
+            self.calibration_start = timestamp
 
-            if h_ratio is None or v_ratio is None:
-                return None
+    def _update_calibration(self, h_ratio: float, v_ratio: float, timestamp: float):
+        if self.is_calibrated:
+            return
 
-            # Use configurable thresholds
-            right_threshold, left_threshold = self.config.horizontal_thresholds
-            up_threshold, down_threshold = self.config.vertical_thresholds
+        self._start_calibration(timestamp)
 
-            # Determine horizontal direction
-            if h_ratio < right_threshold:
-                horizontal_dir = "RIGHT"
-            elif h_ratio > left_threshold:
-                horizontal_dir = "LEFT"
-            else:
-                horizontal_dir = "CENTER"
+        if timestamp - self.calibration_start <= self.config.calibration_duration:
+            self.h_calibration_samples.append(h_ratio)
+            self.v_calibration_samples.append(v_ratio)
+        else:
+            if len(self.h_calibration_samples) >= 10:
+                self.h_center = float(np.median(self.h_calibration_samples))
+                self.v_center = float(np.median(self.v_calibration_samples))
+                self.is_calibrated = True
 
-            # Determine vertical direction
-            if v_ratio < up_threshold:
-                vertical_dir = "UP"
-            elif v_ratio > down_threshold:
-                vertical_dir = "DOWN"
-            else:
-                vertical_dir = "CENTER"
+    def _apply_smoothing(self, prev: Optional[float], current: float, alpha: float) -> float:
+        return current if prev is None else (alpha * current + (1 - alpha) * prev)
 
-            # Combine directions
-            if horizontal_dir == "CENTER" and vertical_dir == "CENTER":
-                return "CENTER"
-            elif horizontal_dir == "CENTER":
-                return vertical_dir
-            elif vertical_dir == "CENTER":
-                return horizontal_dir
-            else:
-                return f"{horizontal_dir}_{vertical_dir}"
+    def _get_stable_direction(self, h_ratio: float, v_ratio: float, timestamp: float) -> Optional[str]:
+        # Apply exponential smoothing
+        self.h_smoothed = self._apply_smoothing(self.h_smoothed, h_ratio, self.config.smoothing_factor)
+        self.v_smoothed = self._apply_smoothing(self.v_smoothed, v_ratio, self.config.smoothing_factor)
 
-        except Exception as e:
-            self.logger.warning(f"Error in gaze direction detection: {e}")
+        h = self.h_smoothed
+        v = self.v_smoothed
+
+        # Update calibration
+        self._update_calibration(h, v, timestamp)
+
+        # Define thresholds with calibration offset
+        right_threshold = self.config.horizontal_thresholds[0]
+        left_threshold = self.config.horizontal_thresholds[1]
+        up_threshold = self.config.vertical_thresholds[0]
+        down_threshold = self.config.vertical_thresholds[1]
+
+        margin = self.config.hysteresis_margin
+
+        # Adjust thresholds based on calibrated center
+        right_th = (self.h_center + (right_threshold - 0.5)) - margin
+        left_th = (self.h_center + (left_threshold - 0.5)) + margin
+        up_th = (self.v_center + (up_threshold - 0.5)) - margin
+        down_th = (self.v_center + (down_threshold - 0.5)) + margin
+
+        # Determine horizontal direction
+        if h < right_th:
+            horizontal = "RIGHT"
+        elif h > left_th:
+            horizontal = "LEFT"
+        else:
+            horizontal = "CENTER"
+
+        # Determine vertical direction
+        if v < up_th:
+            vertical = "UP"
+        elif v > down_th:
+            vertical = "DOWN"
+        else:
+            vertical = "CENTER"
+
+        # Combine directions
+        if horizontal == "CENTER" and vertical == "CENTER":
+            candidate = "CENTER"
+        elif horizontal == "CENTER":
+            candidate = vertical
+        elif vertical == "CENTER":
+            candidate = horizontal
+        else:
+            candidate = f"{horizontal}_{vertical}"
+
+        # Apply dwell time to prevent rapid changes
+        dwell_duration = self.config.dwell_time_ms / 1000.0
+
+        if self.pending_direction != candidate:
+            self.pending_direction = candidate
+            self.pending_start_time = timestamp
+            return None
+        else:
+            if (timestamp - (self.pending_start_time or timestamp)) >= dwell_duration:
+                return self.pending_direction
             return None
 
-    def _process_frame(self, frame: np.ndarray, frame_time: float, frame_idx: int) -> Optional[str]:
-        """Process single frame for gaze detection"""
+    def _process_frame(self, frame: np.ndarray, timestamp: float, frame_idx: int) -> Optional[str]:
         try:
             start_time = time.time()
-            self.gaze_tracker.refresh(frame)
-            direction = self._get_gaze_direction()
+            self.tracker.refresh(frame)
+
+            # Check tracking quality
+            pupils_detected = bool(getattr(self.tracker, "pupils_located", False))
+            h_ratio = self.tracker.horizontal_ratio() if pupils_detected else None
+            v_ratio = self.tracker.vertical_ratio() if pupils_detected else None
+            ratios_valid = (h_ratio is not None) and (v_ratio is not None)
+            face_present = self._detect_face(frame)
+
+            tracking_ok = pupils_detected and ratios_valid and face_present
+            direction = None
+
+            if tracking_ok:
+                direction = self._get_stable_direction(h_ratio, v_ratio, timestamp)
 
             processing_time = time.time() - start_time
-            self.frame_processing_times.append(processing_time)
+            self.frame_times.append(processing_time)
 
-            # Track failures
-            if direction is None:
+            # Update tracking state
+            self.tracking_active = tracking_ok
+
+            if not tracking_ok:
                 self.consecutive_failures += 1
-                self.tracking_failures += 1
+                self.failure_count += 1
 
-                # Log excessive failures periodically
                 if self.consecutive_failures == self.config.max_tracking_failures:
-                    self.logger.warning(f"Tracking failure threshold reached: {self.consecutive_failures} consecutive failures")
-                elif self.consecutive_failures > self.config.max_tracking_failures and self.consecutive_failures % 300 == 0:
-                    self.logger.warning(f"Extended tracking failures: {self.consecutive_failures} consecutive failures")
+                    self.logger.warning(f"Tracking failures reached: {self.consecutive_failures}")
             else:
-                # Reset consecutive failures on successful detection
+                if direction is not None:
+                    self.last_valid_time = timestamp
+                    self.last_valid_frame = frame_idx
+                    self.last_valid_direction = direction
+
                 if self.consecutive_failures > self.config.max_tracking_failures:
                     self.logger.info("Gaze tracking recovered")
                 self.consecutive_failures = 0
@@ -190,14 +287,14 @@ class GazeAnalyzer:
             return direction
 
         except Exception as e:
-            self.logger.error(f"Error processing frame {frame_idx}: {e}")
-            self.tracking_failures += 1
+            self.logger.error(f"Frame processing error at {frame_idx}: {e}")
+            self.failure_count += 1
             self.consecutive_failures += 1
+            self.tracking_active = False
             return None
 
-    def _validate_video_for_tracking(self, video_path: str) -> Dict:
-        """Pre-validate video suitability for gaze tracking"""
-        validation_results = {
+    def _validate_video_suitability(self, video_path: str) -> Dict:
+        validation = {
             'is_suitable': True,
             'warnings': [],
             'recommendations': []
@@ -206,80 +303,76 @@ class GazeAnalyzer:
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
-                validation_results['is_suitable'] = False
-                validation_results['warnings'].append("Cannot open video file")
-                return validation_results
+                validation['is_suitable'] = False
+                validation['warnings'].append("Cannot open video file")
+                return validation
 
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            sample_frames = min(10, frame_count // 10)
-            faces_detected_count = 0
+            sample_count = min(10, frame_count // 10)
+            faces_detected = 0
             frames_checked = 0
 
             face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-            for i in range(sample_frames):
-                frame_pos = int((i / sample_frames) * frame_count)
+            for i in range(max(1, sample_count)):
+                frame_pos = int((i / max(1, sample_count)) * max(1, frame_count - 1))
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
                 ret, frame = cap.read()
-                
+
                 if ret:
                     frames_checked += 1
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     faces = face_cascade.detectMultiScale(gray, 1.1, 4)
                     if len(faces) > 0:
-                        faces_detected_count += 1
+                        faces_detected += 1
 
             cap.release()
 
-            # Analyze results
-            face_detection_rate = faces_detected_count / frames_checked if frames_checked > 0 else 0
+            face_rate = faces_detected / frames_checked if frames_checked > 0 else 0
 
-            if face_detection_rate < 0.3:
-                validation_results['warnings'].append(f"Low face detection rate: {face_detection_rate:.1%}")
-                validation_results['recommendations'].append("Video may not be suitable for reliable gaze tracking")
+            if face_rate < 0.3:
+                validation['warnings'].append(f"Low face detection rate: {face_rate:.1%}")
+                validation['recommendations'].append("Video may not be suitable for gaze tracking")
 
-            if face_detection_rate < 0.1:
-                validation_results['is_suitable'] = False
-                validation_results['warnings'].append("Very low face visibility - gaze tracking likely to fail")
+            if face_rate < 0.1:
+                validation['is_suitable'] = False
+                validation['warnings'].append("Very low face visibility")
 
-            validation_results['face_detection_rate'] = round(face_detection_rate, 2)
-            validation_results['frames_sampled'] = frames_checked
+            validation['face_detection_rate'] = round(face_rate, 2)
+            validation['frames_sampled'] = frames_checked
 
         except Exception as e:
             self.logger.warning(f"Video validation failed: {e}")
-            validation_results['warnings'].append(f"Validation error: {e}")
+            validation['warnings'].append(f"Validation error: {e}")
 
-        return validation_results
+        return validation
 
     def _should_continue_processing(self, frame_idx: int, video_info: Dict) -> bool:
-        """Determine if processing should continue based on failure rate"""
-        # Stop if past 25% of video with >95% failure rate
         if frame_idx > video_info['frame_count'] * 0.25:
-            if self.tracking_failures > 0:
-                failure_rate = self.tracking_failures / frame_idx
-                if failure_rate > self.config.early_stop_failure_rate:
+            if self.failure_count > 0:
+                failure_rate = self.failure_count / frame_idx
+                if failure_rate > self.config.early_stop_threshold:
                     self.logger.warning(f"Stopping due to high failure rate: {failure_rate:.1%}")
                     return False
         return True
 
     def analyze_video(self, video_path: str) -> Dict:
-        """Main video gaze analysis method"""
-        if not self._validate_input(video_path):
+        if not self._validate_video(video_path):
             raise ValueError(f"Invalid video file: {video_path}")
 
-        # Pre-validate video
-        validation = self._validate_video_for_tracking(video_path)
-        self.logger.info(f"Video validation - Face detection rate: {validation.get('face_detection_rate', 0):.1%}")
+        # Validate video suitability
+        validation = self._validate_video_suitability(video_path)
+        self.logger.info(f"Face detection rate: {validation.get('face_detection_rate', 0):.1%}")
 
         for warning in validation.get('warnings', []):
             self.logger.warning(warning)
 
         if not validation['is_suitable']:
             self.logger.error("Video not suitable for gaze tracking")
-            return self._generate_failed_results(video_path, "Video unsuitable for gaze tracking")
+            return self._create_failed_result(video_path, "Video unsuitable for gaze tracking")
 
-        self.logger.info(f"Starting gaze analysis: {os.path.basename(video_path)}")
-        analysis_start = time.time()
+        self.logger.info(f"Starting analysis: {os.path.basename(video_path)}")
+        start_time = time.time()
         self._reset_state()
 
         cap = None
@@ -290,79 +383,76 @@ class GazeAnalyzer:
             if not cap.isOpened():
                 raise RuntimeError(f"Cannot open video: {video_path}")
 
-            video_info = self._get_video_info(cap)
-            consecutive_gaze_failures = 0
-            max_allowed_failures = self.config.max_consecutive_failures
-
+            video_info = self._get_video_metadata(cap)
+            consecutive_tracking_failures = 0
             frame_count = 0
             frames_with_gaze = 0
-            last_progress_log = 0
+            last_log_frame = 0
 
-            # Process video frames
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
-                frame_time = frame_count / video_info['fps'] if video_info['fps'] > 0 else frame_count * 0.033
+                timestamp = frame_count / video_info['fps'] if video_info['fps'] > 0 else frame_count * 0.033
 
-                # Check if processing should continue
+                # Check if should continue processing
                 if frame_count > 300 and not self._should_continue_processing(frame_count, video_info):
                     early_stop = True
                     break
 
-                # Process frame
-                if frame_count % self.config.frame_processing_interval == 0:
-                    gaze_direction = self._process_frame(frame, frame_time, frame_count)
+                # Process frame at intervals
+                if frame_count % self.config.frame_skip == 0:
+                    direction = self._process_frame(frame, timestamp, frame_count)
 
-                    if gaze_direction:
-                        frames_with_gaze += 1
-                        consecutive_gaze_failures = 0
+                    if self.tracking_active:
+                        consecutive_tracking_failures = 0
+                        if direction:
+                            frames_with_gaze += 1
 
                         # Handle direction changes
-                        if gaze_direction != self.current_gaze:
-                            self._handle_gaze_change(gaze_direction, frame_time, frame_count)
+                        if direction != self.current_direction:
+                            self._handle_direction_change(direction, timestamp, frame_count)
                     else:
-                        # Handle consecutive failures
-                        consecutive_gaze_failures += 1
+                        consecutive_tracking_failures += 1
 
-                        if (consecutive_gaze_failures >= max_allowed_failures and 
-                            self.current_gaze is not None):
-                            # End current event due to tracking loss
-                            failure_start_time = frame_time - (consecutive_gaze_failures * self.config.frame_processing_interval / video_info['fps'])
-                            failure_start_frame = frame_count - (consecutive_gaze_failures * self.config.frame_processing_interval)
-                            self._handle_gaze_change(None, failure_start_time, failure_start_frame)
-                            consecutive_gaze_failures = 0
+                        # Calculate tracking loss duration
+                        fps_safe = max(video_info['fps'], 1e-6)
+                        loss_duration = (consecutive_tracking_failures * self.config.frame_skip) / fps_safe
+
+                        # End current event after timeout
+                        if self.current_direction is not None and loss_duration >= self.config.tracking_loss_timeout:
+                            self._end_current_event()
+                            consecutive_tracking_failures = 0
 
                 frame_count += 1
-                self.total_frames_processed = frame_count
+                self.total_frames = frame_count
 
                 # Progress logging
                 progress_interval = max(1800, video_info['frame_count'] // 20)
-                if frame_count - last_progress_log >= progress_interval:
+                if frame_count - last_log_frame >= progress_interval:
                     progress = (frame_count / video_info['frame_count']) * 100
                     self.logger.info(f"Progress: {frame_count}/{video_info['frame_count']} frames ({progress:.1f}%)")
-                    last_progress_log = frame_count
+                    last_log_frame = frame_count
 
             # Finalize processing
             if early_stop:
-                self.logger.warning("Processing stopped early due to excessive tracking failures")
+                self.logger.warning("Processing stopped early due to tracking failures")
 
             final_duration = frame_count / video_info['fps'] if video_info['fps'] > 0 else frame_count * 0.033
-            self._finalize_last_event(final_duration, frame_count)
+            self._finalize_analysis(final_duration, frame_count)
 
-            total_time = time.time() - analysis_start
-            self._calculate_stats(total_time, video_info, frames_with_gaze)
+            total_time = time.time() - start_time
+            self._calculate_statistics(total_time, video_info, frames_with_gaze)
 
             results = self._generate_results(video_path, video_info, total_time)
 
             if early_stop:
                 results['processing_statistics']['early_stop'] = True
-                results['processing_statistics']['frames_processed_percentage'] = round((frame_count / video_info['frame_count']) * 100, 1)
+                results['processing_statistics']['completion_percentage'] = round((frame_count / video_info['frame_count']) * 100, 1)
 
             if len(self.events) > 0:
-                self.logger.info(f"Analysis complete: {len(self.events)} gaze events, "
-                               f"{len(self._get_unique_directions())} unique directions")
+                self.logger.info(f"Analysis complete: {len(self.events)} events, {len(self._get_unique_directions())} directions")
             else:
                 self.logger.warning(f"No gaze events detected. Failure rate: {self.processing_stats.get('tracking_failure_rate', 0):.1f}%")
 
@@ -371,30 +461,68 @@ class GazeAnalyzer:
         except Exception as e:
             self.logger.error(f"Analysis failed: {e}")
             raise
-
         finally:
             if cap is not None:
                 cap.release()
             self._cleanup()
 
-    def _handle_gaze_change(self, new_direction: Optional[str], current_time: float, frame_idx: int):
-        """Handle gaze direction changes"""
+    def _end_current_event(self):
         try:
-            # End previous event if it meets duration threshold
-            if self.current_gaze is not None and self.current_event_start is not None:
-                event_duration = current_time - self.current_event_start
+            if self.current_direction is None or self.current_event_start is None:
+                self.current_direction = None
+                self.current_event_start = None
+                self.current_event_frame = None
+                return
+
+            end_time = self.last_valid_time if self.last_valid_time is not None else self.current_event_start
+            end_frame = self.last_valid_frame if self.last_valid_frame is not None else self.current_event_frame
+
+            event_duration = end_time - self.current_event_start
+
+            if event_duration >= self.config.min_event_duration:
+                h_ratio = self.tracker.horizontal_ratio() or 0.5
+                v_ratio = self.tracker.vertical_ratio() or 0.5
+
+                event = GazeEvent(
+                    event_type="GAZE_DIRECTION",
+                    direction=self.current_direction,
+                    start_time=round(self.current_event_start, 3),
+                    end_time=round(end_time, 3),
+                    duration=round(event_duration, 3),
+                    start_frame=self.current_event_frame,
+                    end_frame=end_frame,
+                    horizontal_ratio=h_ratio,
+                    vertical_ratio=v_ratio,
+                    confidence=self.config.confidence_threshold
+                )
+
+                self.events.append(event)
+
+            # Reset state
+            self.current_direction = None
+            self.current_event_start = None
+            self.current_event_frame = None
+
+        except Exception as e:
+            self.logger.error(f"Error ending current event: {e}")
+
+    def _handle_direction_change(self, new_direction: Optional[str], timestamp: float, frame_idx: int):
+        try:
+            # End previous event if it meets duration requirement
+            if self.current_direction is not None and self.current_event_start is not None:
+                event_duration = timestamp - self.current_event_start
 
                 if event_duration >= self.config.min_event_duration:
-                    h_ratio = self.gaze_tracker.horizontal_ratio()
-                    v_ratio = self.gaze_tracker.vertical_ratio()
+                    h_ratio = self.tracker.horizontal_ratio()
+                    v_ratio = self.tracker.vertical_ratio()
 
                     event = GazeEvent(
                         event_type="GAZE_DIRECTION",
-                        direction=self.current_gaze,
-                        start_timestamp=round(self.current_event_start, 3),
-                        end_timestamp=round(current_time, 3),
+                        direction=self.current_direction,
+                        start_time=round(self.current_event_start, 3),
+                        end_time=round(timestamp, 3),
                         duration=round(event_duration, 3),
-                        start_frame=self.current_event_start_frame,
+                        start_frame=self.current_event_frame,
                         end_frame=frame_idx,
                         horizontal_ratio=h_ratio,
                         vertical_ratio=v_ratio,
@@ -403,39 +531,39 @@ class GazeAnalyzer:
 
                     self.events.append(event)
 
-            # Handle new direction or tracking loss
+            # Start new event or reset state
             if new_direction is None:
-                # Reset tracking state
-                self.current_gaze = None
+                self.current_direction = None
                 self.current_event_start = None
-                self.current_event_start_frame = None
+                self.current_event_frame = None
             else:
-                # Start new event
-                self.current_gaze = new_direction
-                self.current_event_start = current_time
-                self.current_event_start_frame = frame_idx
+                self.current_direction = new_direction
+                self.current_event_start = timestamp
+                self.current_event_frame = frame_idx
 
         except Exception as e:
-            self.logger.error(f"Error handling gaze change: {e}")
+            self.logger.error(f"Error handling direction change: {e}")
 
-    def _finalize_last_event(self, video_duration: float, total_frames: int):
-        """Finalize the last gaze event"""
+    def _finalize_analysis(self, video_duration: float, total_frames: int):
         try:
-            if self.current_gaze is not None and self.current_event_start is not None:
-                event_duration = video_duration - self.current_event_start
+            if self.current_direction is not None and self.current_event_start is not None:
+                end_time = self.last_valid_time if self.last_valid_time is not None else video_duration
+                end_frame = self.last_valid_frame if self.last_valid_frame is not None else total_frames
+
+                event_duration = end_time - self.current_event_start
 
                 if event_duration >= self.config.min_event_duration:
-                    h_ratio = self.gaze_tracker.horizontal_ratio() or 0.5
-                    v_ratio = self.gaze_tracker.vertical_ratio() or 0.5
+                    h_ratio = self.tracker.horizontal_ratio() or 0.5
+                    v_ratio = self.tracker.vertical_ratio() or 0.5
 
                     event = GazeEvent(
                         event_type="GAZE_DIRECTION",
-                        direction=self.current_gaze,
-                        start_timestamp=round(self.current_event_start, 3),
-                        end_timestamp=round(video_duration, 3),
+                        direction=self.current_direction,
+                        start_time=round(self.current_event_start, 3),
+                        end_time=round(end_time, 3),
                         duration=round(event_duration, 3),
-                        start_frame=self.current_event_start_frame,
-                        end_frame=total_frames,
+                        start_frame=self.current_event_frame,
+                        end_frame=end_frame,
                         horizontal_ratio=h_ratio,
                         vertical_ratio=v_ratio,
                         confidence=self.config.confidence_threshold
@@ -444,33 +572,48 @@ class GazeAnalyzer:
                     self.events.append(event)
 
         except Exception as e:
-            self.logger.error(f"Error finalizing last event: {e}")
+            self.logger.error(f"Error finalizing analysis: {e}")
 
     def _reset_state(self):
-        """Reset analyzer state for new analysis"""
         self.events.clear()
-        self.current_gaze = None
+        self.current_direction = None
         self.current_event_start = None
-        self.current_event_start_frame = None
-        self.frame_processing_times.clear()
-        self.tracking_failures = 0
+        self.current_event_frame = None
+        self.frame_times.clear()
+        self.failure_count = 0
         self.consecutive_failures = 0
-        self.total_frames_processed = 0
+        self.total_frames = 0
         self.processing_stats.clear()
 
+        # Reset tracking state
+        self.last_valid_time = None
+        self.last_valid_frame = None
+        self.last_valid_direction = None
+
+        # Reset calibration
+        self.calibration_start = None
+        self.is_calibrated = False
+        self.h_calibration_samples.clear()
+        self.v_calibration_samples.clear()
+        self.h_center = 0.5
+        self.v_center = 0.5
+        self.h_smoothed = None
+        self.v_smoothed = None
+        self.pending_direction = None
+        self.pending_start_time = None
+        self.tracking_active = False
+
     def _get_unique_directions(self) -> List[str]:
-        """Get list of unique gaze directions detected"""
         return list(set(event.direction for event in self.events if event.event_type == "GAZE_DIRECTION"))
 
-    def _calculate_gaze_stats(self) -> Dict:
-        """Calculate gaze direction statistics"""
+    def _calculate_direction_stats(self) -> Dict:
         gaze_events = [e for e in self.events if e.event_type == "GAZE_DIRECTION"]
-        gaze_stats = {}
+        direction_stats = {}
 
         for event in gaze_events:
             direction = event.direction
-            if direction not in gaze_stats:
-                gaze_stats[direction] = {
+            if direction not in direction_stats:
+                direction_stats[direction] = {
                     "count": 0,
                     "total_duration": 0,
                     "avg_duration": 0,
@@ -478,111 +621,108 @@ class GazeAnalyzer:
                     "min_duration": float('inf')
                 }
 
-            stats = gaze_stats[direction]
+            stats = direction_stats[direction]
             stats["count"] += 1
             stats["total_duration"] += event.duration
             stats["max_duration"] = max(stats["max_duration"], event.duration)
             stats["min_duration"] = min(stats["min_duration"], event.duration)
 
         # Calculate averages
-        for direction, stats in gaze_stats.items():
+        for direction, stats in direction_stats.items():
             if stats["count"] > 0:
                 stats["avg_duration"] = round(stats["total_duration"] / stats["count"], 2)
                 stats["total_duration"] = round(stats["total_duration"], 2)
                 stats["max_duration"] = round(stats["max_duration"], 2)
                 stats["min_duration"] = round(stats["min_duration"], 2)
 
-        return gaze_stats
+        return direction_stats
 
-    def _calculate_stats(self, total_time: float, video_info: Dict, frames_with_gaze: int):
-        """Calculate processing performance statistics"""
-        processed_frames = len(self.frame_processing_times)
+    def _calculate_statistics(self, total_time: float, video_info: Dict, frames_with_gaze: int):
+        processed_frames = len(self.frame_times)
 
         self.processing_stats = {
-            'total_processing_time_sec': round(total_time, 2),
-            'avg_frame_processing_time': round(np.mean(self.frame_processing_times), 4) if self.frame_processing_times else 0,
+            'total_processing_time': round(total_time, 2),
+            'avg_frame_time': round(np.mean(self.frame_times), 4) if self.frame_times else 0,
             'frames_processed': processed_frames,
-            'frames_with_gaze_detected': frames_with_gaze,
+            'frames_with_gaze': frames_with_gaze,
             'gaze_detection_rate': round(frames_with_gaze / processed_frames * 100, 1) if processed_frames > 0 else 0,
             'processing_fps': round(processed_frames / total_time, 1) if total_time > 0 else 0,
             'video_fps': video_info['fps'],
-            'tracking_failure_rate': round((self.tracking_failures / processed_frames) * 100, 1) if processed_frames > 0 else 0,
-            'total_tracking_failures': self.tracking_failures
+            'tracking_failure_rate': round((self.failure_count / processed_frames) * 100, 1) if processed_frames > 0 else 0,
+            'total_failures': self.failure_count
         }
 
-    def _assess_integrity(self, gaze_stats: Dict, video_info: Dict) -> Dict:
-        """Assess gaze tracking integrity"""
-        integrity_score = 1.0
-        risk_factors = {}
-        suspicious_patterns = []
+    def _assess_tracking_quality(self, direction_stats: Dict, video_info: Dict) -> Dict:
+        quality_score = 1.0
+        issues = {}
+        warnings = []
 
         total_events = len(self.events)
         video_duration = video_info['duration_sec']
 
-        # No gaze detected
+        # No events detected
         if total_events == 0:
-            suspicious_patterns.append('no_gaze_events_detected')
-            risk_factors['no_gaze'] = {'risk_contribution': 0.9}
-            integrity_score -= 0.9
+            warnings.append('no_gaze_events')
+            issues['no_events'] = {'impact': 0.9}
+            quality_score -= 0.9
 
-        # High tracking failure rate
+        # High failure rate
         failure_rate = self.processing_stats.get('tracking_failure_rate', 0)
         if failure_rate > 50:
-            suspicious_patterns.append('high_tracking_failure_rate')
+            warnings.append('high_failure_rate')
             risk_score = min(0.6, failure_rate / 100)
-            risk_factors['tracking_failures'] = {
+            issues['tracking_failures'] = {
                 'failure_rate': failure_rate,
-                'risk_contribution': risk_score
+                'impact': risk_score
             }
-            integrity_score -= risk_score
+            quality_score -= risk_score
 
-        # Limited gaze diversity
-        unique_directions = len(gaze_stats)
+        # Limited movement
+        unique_directions = len(direction_stats)
         if unique_directions <= 1 and total_events > 0:
-            suspicious_patterns.append('limited_gaze_movement')
-            risk_factors['limited_movement'] = {
+            warnings.append('limited_movement')
+            issues['limited_movement'] = {
                 'unique_directions': unique_directions,
-                'risk_contribution': 0.4
+                'impact': 0.4
             }
-            integrity_score -= 0.4
+            quality_score -= 0.4
 
-        # Excessive gaze changes
+        # Excessive changes
         if video_duration > 0:
             change_rate = total_events / (video_duration / 60)
             if change_rate > 30:
-                suspicious_patterns.append('excessive_gaze_changes')
+                warnings.append('excessive_changes')
                 risk_score = min(0.3, change_rate / 100)
-                risk_factors['excessive_changes'] = {
+                issues['excessive_changes'] = {
                     'changes_per_minute': round(change_rate, 1),
-                    'risk_contribution': risk_score
+                    'impact': risk_score
                 }
-                integrity_score -= risk_score
+                quality_score -= risk_score
 
-        integrity_score = max(0.0, integrity_score)
+        quality_score = max(0.0, quality_score)
 
-        # Determine risk level
-        if integrity_score >= 0.8:
-            risk_level, recommendation = 'LOW', 'ACCEPT'
-        elif integrity_score >= 0.6:
-            risk_level, recommendation = 'MEDIUM', 'REVIEW'
-        elif integrity_score >= 0.4:
-            risk_level, recommendation = 'HIGH', 'REVIEW'
+        # Determine quality level
+        if quality_score >= 0.8:
+            level, recommendation = 'HIGH', 'ACCEPT'
+        elif quality_score >= 0.6:
+            level, recommendation = 'MEDIUM', 'REVIEW'
+        elif quality_score >= 0.4:
+            level, recommendation = 'LOW', 'REVIEW'
         else:
-            risk_level, recommendation = 'CRITICAL', 'REJECT'
+            level, recommendation = 'POOR', 'REJECT'
 
         return {
-            'integrity_score': round(integrity_score, 3),
-            'risk_level': risk_level,
+            'quality_score': round(quality_score, 3),
+            'quality_level': level,
             'recommendation': recommendation,
-            'suspicious_patterns': suspicious_patterns,
-            'risk_factors': risk_factors,
-            'gaze_diversity_score': min(1.0, unique_directions / 5),
+            'warnings': warnings,
+            'issues': issues,
+            'movement_diversity': min(1.0, unique_directions / 5),
             'tracking_reliability': max(0.0, 1.0 - (failure_rate / 100))
         }
 
     def _generate_results(self, video_path: str, video_info: Dict, processing_time: float) -> Dict:
-        """Generate comprehensive analysis results"""
-        gaze_stats = self._calculate_gaze_stats()
+        direction_stats = self._calculate_direction_stats()
 
         # Convert events to serializable format
         events_data = []
@@ -590,8 +730,8 @@ class GazeAnalyzer:
             events_data.append({
                 'event_type': event.event_type,
                 'direction': event.direction,
-                'start_timestamp': event.start_timestamp,
-                'end_timestamp': event.end_timestamp,
+                'start_time': event.start_time,
+                'end_time': event.end_time,
                 'duration': event.duration,
                 'start_frame': event.start_frame,
                 'end_frame': event.end_frame,
@@ -604,69 +744,74 @@ class GazeAnalyzer:
 
         # Gaze analysis summary
         gaze_analysis = {
-            'total_gaze_events': len(self.events),
-            'unique_directions_detected': len(gaze_stats),
+            'total_events': len(self.events),
+            'unique_directions': len(direction_stats),
             'supported_directions': ["LEFT", "RIGHT", "UP", "DOWN", "CENTER", "LEFT_UP", "LEFT_DOWN", "RIGHT_UP", "RIGHT_DOWN"],
-            'detected_directions': list(gaze_stats.keys()),
-            'gaze_statistics': gaze_stats,
+            'detected_directions': list(direction_stats.keys()),
+            'direction_statistics': direction_stats,
             'events': events_data
         }
 
-        integrity_analysis = self._assess_integrity(gaze_stats, video_info)
+        quality_analysis = self._assess_tracking_quality(direction_stats, video_info)
 
         return {
             'video_metadata': {
-                'path': os.path.basename(video_path),
+                'filename': os.path.basename(video_path),
                 'full_path': video_path,
                 **video_info,
                 'analysis_timestamp': time.time()
             },
             'gaze_analysis': gaze_analysis,
-            'integrity_analysis': integrity_analysis,
+            'quality_analysis': quality_analysis,
             'processing_statistics': self.processing_stats,
-            'analysis_parameters': {
+            'configuration': {
                 'min_event_duration': self.config.min_event_duration,
                 'horizontal_thresholds': self.config.horizontal_thresholds,
                 'vertical_thresholds': self.config.vertical_thresholds,
                 'confidence_threshold': self.config.confidence_threshold,
                 'max_tracking_failures': self.config.max_tracking_failures,
-                'max_consecutive_failures': self.config.max_consecutive_failures
+                'max_consecutive_failures': self.config.max_consecutive_failures,
+                'tracking_loss_timeout': self.config.tracking_loss_timeout,
+                'face_detection_enabled': self.config.face_detection_enabled,
+                'calibration_duration': self.config.calibration_duration,
+                'smoothing_factor': self.config.smoothing_factor,
+                'hysteresis_margin': self.config.hysteresis_margin,
+                'dwell_time_ms': self.config.dwell_time_ms
             }
         }
 
-    def _generate_failed_results(self, video_path: str, reason: str) -> Dict:
-        """Generate results structure for failed analysis"""
+    def _create_failed_result(self, video_path: str, reason: str) -> Dict:
         return {
             'video_metadata': {
-                'path': os.path.basename(video_path),
+                'filename': os.path.basename(video_path),
                 'full_path': video_path,
                 'analysis_timestamp': time.time(),
                 'error': reason
             },
             'gaze_analysis': {
-                'total_gaze_events': 0,
-                'unique_directions_detected': 0,
+                'total_events': 0,
+                'unique_directions': 0,
                 'supported_directions': ["LEFT", "RIGHT", "UP", "DOWN", "CENTER", "LEFT_UP", "LEFT_DOWN", "RIGHT_UP", "RIGHT_DOWN"],
                 'detected_directions': [],
-                'gaze_statistics': {},
+                'direction_statistics': {},
                 'events': []
             },
-            'integrity_analysis': {
-                'integrity_score': 0.0,
-                'risk_level': 'CRITICAL',
+            'quality_analysis': {
+                'quality_score': 0.0,
+                'quality_level': 'POOR',
                 'recommendation': 'REJECT',
-                'suspicious_patterns': ['video_unsuitable_for_gaze_tracking'],
-                'risk_factors': {'unsuitable_video': {'risk_contribution': 1.0}},
-                'gaze_diversity_score': 0.0,
+                'warnings': ['video_unsuitable'],
+                'issues': {'unsuitable_video': {'impact': 1.0}},
+                'movement_diversity': 0.0,
                 'tracking_reliability': 0.0
             },
             'processing_statistics': {
-                'total_processing_time_sec': 0,
+                'total_processing_time': 0,
                 'tracking_failure_rate': 100.0,
                 'processing_failed': True,
                 'failure_reason': reason
             },
-            'analysis_parameters': {
+            'configuration': {
                 'min_event_duration': self.config.min_event_duration,
                 'horizontal_thresholds': self.config.horizontal_thresholds,
                 'vertical_thresholds': self.config.vertical_thresholds
@@ -674,32 +819,87 @@ class GazeAnalyzer:
         }
 
     def cleanup(self):
-        """Clean up resources"""
         try:
             self.events.clear()
-            self.frame_processing_times.clear()
+            self.frame_times.clear()
             self.processing_stats.clear()
-            
-            # Reset gaze tracker state
-            self.current_gaze = None
+
+            # Reset state
+            self.current_direction = None
             self.current_event_start = None
-            self.current_event_start_frame = None
-            
+            self.current_event_frame = None
+
+            # Reset tracking state
+            self.last_valid_time = None
+            self.last_valid_frame = None
+            self.last_valid_direction = None
+            self.calibration_start = None
+            self.is_calibrated = False
+            self.h_calibration_samples.clear()
+            self.v_calibration_samples.clear()
+            self.h_center = 0.5
+            self.v_center = 0.5
+            self.h_smoothed = None
+            self.v_smoothed = None
+            self.pending_direction = None
+            self.pending_start_time = None
+            self.tracking_active = False
+
             gc.collect()
+
         except Exception as e:
-            self.logger.warning(f"Cleanup issues: {e}")
+            self.logger.warning(f"Cleanup error: {e}")
 
     def _cleanup(self):
-        """Internal cleanup"""
         gc.collect()
 
 
-def analyze_video_gaze(video_path: str, config: GazeConfig = None) -> Dict:
-    """Convenience function for video gaze analysis"""
-    analyzer = GazeAnalyzer(config)
+# Convenience function for easy usage
+def analyze_gaze_tracking(video_path: str, config: GazeTrackerConfig = None) -> Dict:
+    """Analyze gaze tracking in a video file"""
+    tracker = VideoGazeTracker(config)
     try:
-        return analyzer.analyze_video(video_path)
+        return tracker.analyze_video(video_path)
     finally:
-        analyzer.cleanup()
+        tracker.cleanup()
 
 
+# Example usage for FastAPI integration
+class GazeTrackingAPI:
+    """FastAPI-ready gaze tracking service"""
+
+    def __init__(self, config: GazeTrackerConfig = None):
+        self.config = config or GazeTrackerConfig()
+
+    async def analyze_video_file(self, video_path: str) -> Dict:
+        """Async video analysis for FastAPI endpoints"""
+        return analyze_gaze_tracking(video_path, self.config)
+
+    def get_default_config(self) -> Dict:
+        """Get default configuration as dictionary"""
+        return {
+            'min_event_duration': self.config.min_event_duration,
+            'horizontal_thresholds': self.config.horizontal_thresholds,
+            'vertical_thresholds': self.config.vertical_thresholds,
+            'frame_skip': self.config.frame_skip,
+            'confidence_threshold': self.config.confidence_threshold,
+            'face_detection_enabled': self.config.face_detection_enabled,
+            'calibration_duration': self.config.calibration_duration,
+            'smoothing_factor': self.config.smoothing_factor
+        }
+
+
+if __name__ == "__main__":
+    # Example usage
+    config = GazeTrackerConfig(
+        tracking_loss_timeout=0.3,
+        face_detection_enabled=True,
+        frame_skip=12,
+        calibration_duration=2.0,
+        smoothing_factor=0.25,
+        hysteresis_margin=0.05,
+        dwell_time_ms=200
+    )
+
+    result = analyze_gaze_tracking("./videos/sample_video.mp4", config)
+    print(json.dumps(result, indent=2))

@@ -18,7 +18,7 @@ from pyannote.audio import Pipeline
 from pyannote.core import Annotation, Segment
 import torchaudio
 from collections import defaultdict
-
+import pprint
 warnings.filterwarnings("ignore")
 
 @dataclass
@@ -454,7 +454,7 @@ class VoiceAnalyzer:
 
             original_segments = len(list(diarization.itertracks()))
             final_segments = len(list(smoothed_diarization.itertracks()))
-            self.logger.info(f"Post-processing: {original_segments} → {final_segments} segments")
+            self.logger.info(f"Post-processing: {original_segments} ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ {final_segments} segments")
 
             return smoothed_diarization
 
@@ -1219,3 +1219,7 @@ class VoiceAnalyzer:
 
 
 
+if __name__ == "__main__":
+    analyzer = VoiceAnalyzer(hf_token="fsdhf")
+    res = analyzer.analyze_video_voices("./videos/5 tips to get your VIRTUAL INTERVIEWS right!.mp4")
+    pprint.pprint(res)

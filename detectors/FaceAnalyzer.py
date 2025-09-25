@@ -19,7 +19,7 @@ class AnalysisConfig:
     dbscan_eps: float = 0.5
     dbscan_min_samples: int = 2
     min_out_of_view_duration: float = 1.0
-    frame_processing_interval: int = 15
+    frame_processing_interval: int = 12
     face_detection_model: str = "hog"
     face_detection_scale: float = 0.5
     confidence_threshold: float = 0.7
@@ -518,3 +518,6 @@ def analyze_video(video_path: str, config: AnalysisConfig = None) -> Dict:
         analyzer.cleanup()
 
 
+if __name__ == "__main__":
+    analyzer = analyze_video('./videos\How to Look at the Camera Whilst Reading a Script.mp4')
+    print(analyzer)
